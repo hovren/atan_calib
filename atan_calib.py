@@ -70,27 +70,27 @@ def lensdist(X,wc,lgamma):
     
     return Y
 
-def load_directory(image_dir, args):
-    image_files = glob.glob(os.path.join(image_dir, '*.png'))
+def build_corners(image_dir, chessboard_size):
+    image_files = glob.glob(os.path.join(image_dir, '*.png'))    
+    f = h5py.File(os.path.join(image_dir, 'corners.hdf'), 'w')
+    grp = f.create_group("images") 
     
-    lines = []
-    corner_list = []
-    cw, ch = args.chessboard
-    images = []
     for fname in image_files:
         im = cv2.imread(fname, cv2.CV_LOAD_IMAGE_GRAYSCALE)
         if im is None:
             print "Skipping {0}".format(fname)
             continue
-            
-        has_board, corners = cv2.findChessboardCorners(im, args.chessboard)
+        
+        has_board, corners = cv2.findChessboardCorners(im, chessboard_size)
         if has_board:
             term = ( cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT, 30, 0.1 )
             cv2.cornerSubPix(im, corners, (5, 5), (-1, -1), term)
-            images.append(im)
-            corner_list.append(corners)
-
-    return corner_list, images
+            fname_base = os.path.basename(fname)
+            imgrp = grp.create_group(fname_base)
+            imgrp.create_dataset("image", data=im)
+            imgrp.create_dataset("corners", data=corners)
+    
+    f.close()
 
 def save_directory_hdf(corners, images, args):
     outfile = os.path.join(args.input, 'corners.hdf')
@@ -110,7 +110,7 @@ def optfunc_atan_lines(x, lines):
         residual = []
         for l in lines:
             lu = lensdist_inv(l.T, wc, lgamma).T
-            #print lu
+            #print luatan-reproj-K
             a = lu[0] # Line endpoint
             n = lu[-1]-lu[0] # Direction vector
             n /= np.sqrt(np.inner(n, n))
@@ -128,41 +128,90 @@ def lines_from_corners(corners, chessboard_size):
     
     return vlines, hlines
     
-def load_saved_hdf(input_file):
+def load_corners(input_file):
     f = h5py.File(input_file, 'r')
     corner_list = []
     images = []
     grp = f["images"]
-    for key in grp.keys():
+    for key in sorted(grp.keys()):
         imgrp = grp[key]
         corner_list.append(imgrp["corners"].value)
         images.append(imgrp["image"].value)
+    f.close()
     return corner_list, images
+
+def chessboard_to_world(chessboard_size):
+    pattern_points = np.zeros( (np.prod(chessboard_size), 3), np.float32 )
+    pattern_points[:,:2] = np.indices(chessboard_size).T.reshape(-1, 2)
+    return pattern_points
+
+def calibrate_opencv(corners, images, args):
+    h, w = images[0].shape[:2]
+    
+    object_points = [chessboard_to_world(args.chessboard),]*len(corners)
+    flags = cv2.cv.CV_CALIB_FIX_K1 | cv2.cv.CV_CALIB_FIX_K2 | cv2.cv.CV_CALIB_FIX_K3 | \
+            cv2.cv.CV_CALIB_ZERO_TANGENT_DIST
+    print "Running OpenCV calibrator on {:d} image points".format(len(corners))
+    rms, camera_matrix, dist_coefs, rvecs, tvecs = cv2.calibrateCamera(object_points, corners, (w, h), flags=flags)
+    print "RMS", rms
+    return camera_matrix, rvecs, tvecs
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("input")
+    parser.add_argument("inputdir")
     parser.add_argument("--chessboard", type=int, nargs=2, default=(6,8))
     parser.add_argument("--plot", action="store_true")     
-    parser.add_argument("--mode", choices=("atan-lines",), default="atan-lines")
+    parser.add_argument("--mode", choices=("atan-lines", "atan-reproj-K"), default="atan-lines")
+    parser.add_argument("--recalc-opencv", action="store_true")
     args = parser.parse_args()
-    
-    input_file = os.path.expanduser(args.input)
-    
-    if os.path.isdir(input_file):
-        print "Loading directory"
-        corners, images = load_directory(input_file, args)
-        print "Saving extracted data"
-        save_directory_hdf(corners, images, args)
-    elif os.path.isfile(input_file) and os.path.splitext(input_file)[1] == '.hdf':
-        print "Loading precalculated data"
-        corners, images = load_saved_hdf(input_file)
-    else:
-        raise Exception("Input parameter {args.input} was neither image directory nor HDF5 file")
-    
 
+    
+    corners_fname = os.path.join(args.inputdir, "corners.hdf")
 
-    if args.mode == "atan-lines":
+    if not os.path.exists(corners_fname):
+        print "Creating {}".format(corners_fname)
+        build_corners(args.inputdir, args.chessboard)
+
+    if args.mode == 'atan-reproj-K':
+        if "opencv_calibration" in hdf_file.keys() and not args.recalc_opencv:
+            print "Loading old calibration values"
+            opencvgrp = hdf_file["opencv_calibration"]
+            K = opencvgrp["camera_matrix"].value
+            imlistgrp = opencvgrp["images"]
+            R_list = []
+            t_list = []
+            for key in sorted(imlistgrp.keys()):
+                imgrp = imlistgrp[key]
+                R = imgrp["R"].value
+                t = imgrp["t"].value
+                R_list.append(R)
+                t_list.append(t)
+        else:
+            if "opencv_calibration" in hdf_file.keys():
+                del hdf_file["opencv_calibration"]
+                hdf_file.flush()
+            K, R_list, t_list = calibrate_opencv(corners, images, args)
+            opencvgrp = hdf_file.create_group("opencv_calibration")
+            opencvgrp.create_dataset("camera_matrix", data=K)            
+            immetagrp = opencvgrp.create_group("images")
+            zpad = int(np.ceil(np.log10(len(R_list)))) + 1
+            for i, (R, t) in enumerate(zip(R_list, t_list)):
+                imgrpstr = "{0:0{zpad}d}".format(i, zpad=zpad)
+                imgrp = immetagrp.create_group(imgrpstr)
+                imgrp.create_dataset("R", data=R)
+                imgrp.create_dataset("t", data=t)
+                #imgrp["image"] = hdf_file["/images/{}".format(imgrpstr)] #Link to data
+            hdf_file.flush()
+        
+        # Now we have a guess of the intrinsic camera matrix
+        # and the camera rotation and translation vectors
+        print "Camera matrix according to OpenCV"
+        print K
+        
+        
+
+    elif args.mode == "atan-lines":
+        corners, images = load_corners(corners_fname)
         x0 = np.array([1920/2, 1080/2, 0.0001])
         lines = []
         for vl, hl in [lines_from_corners(c, args.chessboard) for c in corners]:
