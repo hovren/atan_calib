@@ -229,6 +229,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=("atan-lines", "atan-reproj-K"), default="atan-lines")
     parser.add_argument("--recalc-opencv", action="store_true")
     parser.add_argument("--view", type=int, default=None, nargs='+')
+    parser.add_argument("--view-mode", choices=("opt-result","rectify"), default="opt-result")
     parser.add_argument("--max", type=int, default=None)
     args = parser.parse_args()
     print args
@@ -258,39 +259,66 @@ if __name__ == "__main__":
             
             object_points = chessboard_to_world(args.chessboard)
             plt.figure()
-            gs = plt.GridSpec(5,5)
-            imax = plt.subplot(gs[:4,:])
-            resax = plt.subplot(gs[4,:])
             for idx in indices:
-                imax.clear()
-                resax.clear()
                 fname = sorted(imlistgrp.keys())[idx]
                 print "Looking at", fname
                 imgrp = imlistgrp[fname]
-                im = imgrp["image"].value
-                corners = imgrp["corners"].value
-                plt.gray()
-                imax.imshow(im)
-                plt.title(fname)
-                corners = corners.T.reshape(2,-1)
-                x = corners[0]
-                y = corners[1]
-                #plt.plot(x,y,linewidth=4)
-                imax.scatter(x,y, color='g')
-                
-                
                 R = imgrp["R"].value
-                t = imgrp["t"].value.reshape(3,1)         
-                u = R.dot(object_points.T) + t
-                u /= np.tile(u[2], (3,1))
-                xnd = lensdist(u, wc, float(lgamma))        
-                xhat = K.dot(xnd)
-                xhat /= np.tile(xhat[2], (3,1))
+                t = imgrp["t"].value.reshape(3,1)
+                im = imgrp["image"].value
+                corners = imgrp["corners"].value.T.reshape(2,-1)
                 
-                imax.scatter(xhat[0], xhat[1], color='r', marker='x')
-                
-                d = corners - xhat[:2]
-                resax.hist(d.flatten())
+                if args.view_mode == "opt-result":
+                    plt.clf()
+                    gs = plt.GridSpec(5,5)
+                    imax = plt.subplot(gs[:4,:])
+                    resax = plt.subplot(gs[4,:])
+                    imax.clear()
+                    resax.clear()
+                    
+                    plt.gray()
+                    imax.imshow(im)
+                    plt.title(fname)
+                    x = corners[0]
+                    y = corners[1]
+                    imax.scatter(x,y, color='g')
+                    
+                    u = R.dot(object_points.T) + t
+                    u /= np.tile(u[2], (3,1))
+                    xnd = lensdist(u, wc, float(lgamma))        
+                    xhat = K.dot(xnd)
+                    xhat /= np.tile(xhat[2], (3,1))
+                    
+                    imax.scatter(xhat[0], xhat[1], color='r', marker='x')
+                    
+                    d = corners - xhat[:2]
+                    resax.hist(d.flatten())
+                else:
+                    h, w = im.shape[:2]
+                    xmap, ymap = np.meshgrid(range(w), range(h))
+                    m = np.dstack((xmap, ymap))
+                    ptmp = m.T.reshape(2,-1)
+                    p = np.ones((3, ptmp.shape[1]))
+                    p[:2] = ptmp
+                    
+                    
+                    P = np.linalg.inv(K).dot(p)
+                    P /= np.tile(P[2], (3,1))
+                    Pu = lensdist_inv(P, wc, lgamma)
+                    pu = K.dot(Pu)
+                    pu /= np.tile(pu[2], (3,1))
+                    pu2d = pu[:2]
+
+                    mu = pu2d.reshape(m.shape[::-1]).T
+                    xmapu = mu[:,:,0]
+                    ymapu= mu[:,:,1]
+                    rectim = rspy.forwardinterp.forwardinterp(im.astype('float64'), xmapu, ymapu)
+                    
+                    plt.subplot(2,1,1)
+                    plt.imshow(im)
+                    plt.subplot(2,1,2)
+                    plt.imshow(rectim)                    
+                    
                 plt.tight_layout()
                 plt.draw()
                 plt.waitforbuttonpress()
@@ -403,6 +431,20 @@ if __name__ == "__main__":
             imgrp["t"] = t
             imgrp["local_index"] = i
         f.close()
+        
+        # Store short results
+        f2 = h5py.File(os.path.join(args.inputdir, 'atan_calibration.hdf'), 'w')
+        fx, fy, cx, cy, wx, wy, lgamma = x[:7]
+        wc = np.array([wx, wy])
+        K = np.array([[ fx, 0,  cx],
+                      [ 0,  fy, cy],
+                      [ 0,  0,  1]])
+        f2["K"] = K
+        f2["wc"] = wc
+        f2["lgamma"] = lgamma
+        f2["opt_residual_mean"] = np.mean(infodict['fvec'])
+        f2["opt_residual_std"] = np.std(infodict['fvec'])
+        f2.close()
             
 
     elif args.mode == "atan-lines":
