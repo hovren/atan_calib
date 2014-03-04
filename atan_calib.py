@@ -132,29 +132,94 @@ def load_corners(input_file):
     f = h5py.File(input_file, 'r')
     corner_list = []
     images = []
+    image_keys = []
     grp = f["images"]
     for key in sorted(grp.keys()):
         imgrp = grp[key]
         corner_list.append(imgrp["corners"].value)
         images.append(imgrp["image"].value)
+        image_keys.append(key)
     f.close()
-    return corner_list, images
+    return corner_list, images, image_keys
 
 def chessboard_to_world(chessboard_size):
     pattern_points = np.zeros( (np.prod(chessboard_size), 3), np.float32 )
     pattern_points[:,:2] = np.indices(chessboard_size).T.reshape(-1, 2)
     return pattern_points
 
-def calibrate_opencv(corners, images, args):
+def calibrate_opencv(corners, images, chessboard_size):
     h, w = images[0].shape[:2]
     
-    object_points = [chessboard_to_world(args.chessboard),]*len(corners)
+    object_points = [chessboard_to_world(chessboard_size),]*len(corners)
     flags = cv2.cv.CV_CALIB_FIX_K1 | cv2.cv.CV_CALIB_FIX_K2 | cv2.cv.CV_CALIB_FIX_K3 | \
             cv2.cv.CV_CALIB_ZERO_TANGENT_DIST
     print "Running OpenCV calibrator on {:d} image points".format(len(corners))
     rms, camera_matrix, dist_coefs, rvecs, tvecs = cv2.calibrateCamera(object_points, corners, (w, h), flags=flags)
     print "RMS", rms
     return camera_matrix, rvecs, tvecs
+
+def build_opencv_calibration(image_dir, chessboard_size):
+    corners_fname = os.path.join(image_dir, 'corners.hdf')
+    print "Loading from", corners_fname
+    corners, images, image_keys = load_corners(corners_fname)
+    K, rvecs, tvecs = calibrate_opencv(corners, images, chessboard_size)
+    
+    ocvcal_fname = os.path.join(image_dir, 'ocvcal.hdf')
+    f = h5py.File(ocvcal_fname, 'w')
+    ocvgrp = f.create_group("opencv_calibration")
+    ocvgrp.create_dataset("K", data=K)
+    imlistgrp = ocvgrp.create_group("images")
+    for r, t, key in zip(rvecs, tvecs, image_keys):
+        imgrp = imlistgrp.create_group(key)
+        imgrp.create_dataset("R", data=r)
+        imgrp.create_dataset("t", data=t)
+        imgrp["corners"] = h5py.ExternalLink("corners.hdf", "images/{}/corners".format(key))
+        imgrp["image"] = h5py.ExternalLink("corners.hdf", "images/{}/image".format(key))
+    f.close()
+    
+
+def load_ocvcal(ocvcal_fname):
+    images = []
+    rvecs = []
+    tvecs = []
+    corners = []
+    image_keys = []
+    
+    f = h5py.File(ocvcal_fname, 'r')
+    ocvgrp = f["opencv_calibration"]
+    K = ocvgrp["K"].value
+    imlistgrp = ocvgrp["images"]
+    for key in sorted(imlistgrp.keys()):
+        imgrp = imlistgrp[key]
+        corners.append(imgrp["corners"].value)
+        images.append(imgrp["image"].value)
+        rvecs.append(imgrp["R"].value)
+        tvecs.append(imgrp["t"].value)
+        image_keys.append(key)
+    f.close()
+    return K, rvecs, tvecs, corners, images, image_keys
+
+
+def optfunc_reproj(x, corner_list, object_points):
+    fx, fy, cx, cy, wx, wy, lgamma = x[:7]
+    wc = np.array([wx, wy])
+    K = np.array([[ fx, 0,  cx],
+                  [ 0,  fy, cy],
+                  [ 0,  0,  1]])
+    residuals = []
+    for i, corners in enumerate(corner_list):
+        offset = 7+6*i
+        r = x[offset:offset+3]
+        t = x[offset+3:offset+6].reshape(3,1)
+        R = cv2.Rodrigues(r)[0]
+        u = R.dot(object_points.T) + t
+        u /= np.tile(u[2], (3,1))
+        xnd = lensdist(u, wc, float(lgamma))        
+        xhat = K.dot(xnd)
+        xhat /= np.tile(xhat[2], (3,1))
+        d = corners.T.reshape(2,-1) - xhat[:2]
+        residuals.extend(d.flatten())
+    return residuals
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -163,61 +228,191 @@ if __name__ == "__main__":
     parser.add_argument("--plot", action="store_true")     
     parser.add_argument("--mode", choices=("atan-lines", "atan-reproj-K"), default="atan-lines")
     parser.add_argument("--recalc-opencv", action="store_true")
+    parser.add_argument("--view", type=int, default=None, nargs='+')
+    parser.add_argument("--max", type=int, default=None)
     args = parser.parse_args()
+    print args
 
+    # Only viewing?
+    if args.view is not None:
+        if args.mode == 'atan-reproj-K':
+            f = h5py.File(os.path.join(args.inputdir, 'atanprojres.hdf'))
+            imlistgrp = f["images"]
+            
+            num_images = len(imlistgrp.keys())
+            if len(args.view)==1 and args.view[0] == -1:
+                indices = range(num_images)
+            elif np.any(np.array(args.view) >= num_images) or np.any(np.array(args.view) < 0):
+                raise Exception("Bad view parameter")
+            else:
+                indices = args.view
+            
+            x_sol = f["x"].value
+            plt.hist(f["residuals"])
+            plt.show()
+            fx, fy, cx, cy, wx, wy, lgamma = x_sol[:7]
+            wc = np.array([wx, wy])
+            K = np.array([[ fx, 0,  cx],
+                          [ 0,  fy, cy],            
+                          [ 0,  0,  1]])
+            
+            object_points = chessboard_to_world(args.chessboard)
+            plt.figure()
+            gs = plt.GridSpec(5,5)
+            imax = plt.subplot(gs[:4,:])
+            resax = plt.subplot(gs[4,:])
+            for idx in indices:
+                imax.clear()
+                resax.clear()
+                fname = sorted(imlistgrp.keys())[idx]
+                print "Looking at", fname
+                imgrp = imlistgrp[fname]
+                im = imgrp["image"].value
+                corners = imgrp["corners"].value
+                plt.gray()
+                imax.imshow(im)
+                plt.title(fname)
+                corners = corners.T.reshape(2,-1)
+                x = corners[0]
+                y = corners[1]
+                #plt.plot(x,y,linewidth=4)
+                imax.scatter(x,y, color='g')
+                
+                
+                R = imgrp["R"].value
+                t = imgrp["t"].value.reshape(3,1)         
+                u = R.dot(object_points.T) + t
+                u /= np.tile(u[2], (3,1))
+                xnd = lensdist(u, wc, float(lgamma))        
+                xhat = K.dot(xnd)
+                xhat /= np.tile(xhat[2], (3,1))
+                
+                imax.scatter(xhat[0], xhat[1], color='r', marker='x')
+                
+                d = corners - xhat[:2]
+                resax.hist(d.flatten())
+                plt.tight_layout()
+                plt.draw()
+                plt.waitforbuttonpress()
+            
+        sys.exit(0)
     
+    # Build corners from input directory
     corners_fname = os.path.join(args.inputdir, "corners.hdf")
-
     if not os.path.exists(corners_fname):
         print "Creating {}".format(corners_fname)
         build_corners(args.inputdir, args.chessboard)
 
     if args.mode == 'atan-reproj-K':
-        if "opencv_calibration" in hdf_file.keys() and not args.recalc_opencv:
-            print "Loading old calibration values"
-            opencvgrp = hdf_file["opencv_calibration"]
-            K = opencvgrp["camera_matrix"].value
-            imlistgrp = opencvgrp["images"]
-            R_list = []
-            t_list = []
-            for key in sorted(imlistgrp.keys()):
-                imgrp = imlistgrp[key]
-                R = imgrp["R"].value
-                t = imgrp["t"].value
-                R_list.append(R)
-                t_list.append(t)
-        else:
-            if "opencv_calibration" in hdf_file.keys():
-                del hdf_file["opencv_calibration"]
-                hdf_file.flush()
-            K, R_list, t_list = calibrate_opencv(corners, images, args)
-            opencvgrp = hdf_file.create_group("opencv_calibration")
-            opencvgrp.create_dataset("camera_matrix", data=K)            
-            immetagrp = opencvgrp.create_group("images")
-            zpad = int(np.ceil(np.log10(len(R_list)))) + 1
-            for i, (R, t) in enumerate(zip(R_list, t_list)):
-                imgrpstr = "{0:0{zpad}d}".format(i, zpad=zpad)
-                imgrp = immetagrp.create_group(imgrpstr)
-                imgrp.create_dataset("R", data=R)
-                imgrp.create_dataset("t", data=t)
-                #imgrp["image"] = hdf_file["/images/{}".format(imgrpstr)] #Link to data
-            hdf_file.flush()
+        # Is there an existing opencv calibration?
+        ocvcal_fname = os.path.join(args.inputdir, 'ocvcal.hdf')
+        if not os.path.exists(ocvcal_fname) or args.recalc_opencv:
+            build_opencv_calibration(args.inputdir, args.chessboard)
+
+        K, rvecs, tvecs, corner_list, images, image_keys = load_ocvcal(ocvcal_fname)
+        
+        if args.max is not None:
+            indices = range(len(image_keys))
+            np.random.shuffle(indices)
+            indices = indices[:args.max]
+            rvecs = [rvecs[i] for i in indices]
+            tvecs = [tvecs[i] for i in indices]
+            corner_list = [corner_list[i] for i in indices]
+            images = [images[i] for i in indices]
+            image_keys = [image_keys[i] for i in indices]
+                
         
         # Now we have a guess of the intrinsic camera matrix
         # and the camera rotation and translation vectors
         print "Camera matrix according to OpenCV"
         print K
         
+
+        # Sanity check, just to look at the reprojection errors
+        if False:
+            object_points = chessboard_to_world(args.chessboard)        
+            for i, (r, t, im, corn) in enumerate(zip(rvecs, tvecs, images, corner_list)):
+                print i
+                R = cv2.Rodrigues(r)[0]
+                x = K.dot(R.dot(object_points.T) + t)
+                x /= np.tile(x[2], (3,1))
+                print x[:, 5:]
+                print corn.T.reshape(2,-1)[:,5:]
+                print "---"
+                if i == 1:
+                    break
         
+        
+        h, w = images[0].shape[:2]
+
+        # OpenCV projection is x ~ K(RX + t)
+        # Let the optimization parameters, in order, be
+        # fx, fy, cx, cy of camera matrix K (5 parameters)
+        # wx, wy, lgamma of atan model (3 parameters)
+        # (rvecs_k, tvecs_k) ((3+3)*N parameters, where N is number of images)
+        # Total: 8 + 6N parameters
+        num_params = 4 + 3 + 6 * len(images)
+        x0 = np.zeros((num_params,))
+        x0[0] = K[0,0] # fx
+        x0[1] = K[1,1] # fy
+        x0[2] = K[0,2] # cx
+        x0[3] = K[1,2] # cy
+        x0[4] = 0 #w/2 # wx
+        x0[5] = 0 #h/2 # wy
+        x0[6] = 0.1 # lgamma
+        for i, (r, t) in enumerate(zip(rvecs, tvecs)):
+            offset = 7+6*i
+            x0[offset:offset+3] = r.flatten()
+            x0[offset+3:offset+6] = t.flatten()
+        
+        #print x0
+        object_points = chessboard_to_world(args.chessboard)
+        
+        residuals = optfunc_reproj(x0, corner_list, object_points)
+        #print residuals
+        #print np.mean(residuals), np.std(residuals)        
+        
+        print "Running atan-lines optimizer on {:d} points".format(len(corner_list)*np.prod(args.chessboard))
+        #x, covx, infodict, mesg, ier = scipy.optimize.leastsq(optfunc_reproj_late, x0, (corner_list, object_points), full_output=True)
+        scaling = np.ones_like(x0)
+        scaling[:4] = 100.0
+        scaling[5:6] = 1000.0
+        scaling[7] = 0.001
+        x, covx, infodict, mesg, ier = scipy.optimize.leastsq(optfunc_reproj, x0, (corner_list, object_points), diag=scaling, full_output=True)
+        print "X[:7] = ",x[:7]
+        print mesg
+        print infodict['nfev'], "evaluations"
+
+        # Store results        
+        atanproj_fname = os.path.join(args.inputdir, 'atanprojres.hdf')
+        f = h5py.File(atanproj_fname, 'w')
+        f["residuals"] = infodict['fvec']
+        f["nfev"] = infodict['nfev']
+        f["x"] = x
+        f["mesg"] = mesg
+        f["ier"] = ier
+        imlistgrp = f.create_group("images")
+        for i, key in enumerate(image_keys):
+            imgrp = imlistgrp.create_group(key)
+            offset = 7+6*i
+            r = x[offset:offset+3]
+            t = x[offset+3:offset+6]
+            imgrp["image"] = h5py.ExternalLink("corners.hdf", "images/{}/image".format(key))
+            imgrp["corners"] = h5py.ExternalLink("corners.hdf", "images/{}/corners".format(key))
+            imgrp["R"] = cv2.Rodrigues(r)[0]
+            imgrp["t"] = t
+            imgrp["local_index"] = i
+        f.close()
+            
 
     elif args.mode == "atan-lines":
-        corners, images = load_corners(corners_fname)
+        corners, images, image_keys = load_corners(corners_fname)
         x0 = np.array([1920/2, 1080/2, 0.0001])
         lines = []
         for vl, hl in [lines_from_corners(c, args.chessboard) for c in corners]:
             lines.extend(vl)
             lines.extend(hl)
-        
+    
         print "Running atan-lines optimizer on {:d} line segments".format(len(lines))
         x, covx, infodict, mesg, ier = scipy.optimize.leastsq(optfunc_atan_lines, x0, (lines, ), diag=(1000,1000,0.001), full_output=True, xtol=1e-10)
         print "X=",x
