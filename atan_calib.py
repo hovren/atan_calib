@@ -314,6 +314,20 @@ if __name__ == "__main__":
                     ymapu= mu[:,:,1]
                     rectim = rspy.forwardinterp.forwardinterp(im.astype('float64'), xmapu, ymapu)
                     
+                    # Aaand back
+                    # Nice to have to remember order of things for projections
+                    if False:
+                        pu3d = np.linalg.inv(K).dot(pu)
+                        pu3d_2 = lensdist(pu3d, wc, lgamma)
+                        pu3d_2d = K.dot(pu3d_2)
+                        pu3d_2d /= np.tile(pu3d_2d[2], (3,1))
+                        
+                        print pu3d_2d
+                        print p
+                        dtmp = np.sum((pu3d_2d - p)**2, axis=0)
+                        print dtmp
+                        print dtmp.min(), dtmp.max()
+                    
                     plt.subplot(2,1,1)
                     plt.imshow(im)
                     plt.subplot(2,1,2)
