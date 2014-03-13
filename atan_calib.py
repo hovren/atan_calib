@@ -226,7 +226,7 @@ if __name__ == "__main__":
     parser.add_argument("inputdir")
     parser.add_argument("--chessboard", type=int, nargs=2, default=(6,8))
     parser.add_argument("--plot", action="store_true")     
-    parser.add_argument("--mode", choices=("atan-lines", "atan-reproj-K"), default="atan-lines")
+    parser.add_argument("--mode", choices=("atan-lines", "atan-reproj-K"), default="atan-reproj-K")
     parser.add_argument("--recalc-opencv", action="store_true")
     parser.add_argument("--view", type=int, default=None, nargs='+')
     parser.add_argument("--view-mode", choices=("opt-result","rectify"), default="opt-result")
