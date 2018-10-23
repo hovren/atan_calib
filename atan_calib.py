@@ -17,9 +17,6 @@ import matplotlib.pyplot as plt
 import scipy.optimize
 import h5py
 
-sys.path.append("/home/hannes/Code/rspy/build/lib.linux-x86_64-2.7/")
-import rspy
-
 def lensdist_inv(X,wc,lgamma):
     """
     Apply inverse atan-model lens distorsion
@@ -71,17 +68,17 @@ def lensdist(X,wc,lgamma):
     return Y
 
 def build_corners(image_dir, chessboard_size):
-    image_files = glob.glob(os.path.join(image_dir, '*.png'))    
+    image_files = glob.glob(os.path.join(image_dir, '*.png'))
     f = h5py.File(os.path.join(image_dir, 'corners.hdf'), 'w')
     grp = f.create_group("images") 
     
     for fname in image_files:
-        im = cv2.imread(fname, cv2.CV_LOAD_IMAGE_GRAYSCALE)
+        im = cv2.imread(fname, cv2.IMREAD_GRAYSCALE)
         if im is None:
-            print "Skipping {0}".format(fname)
+            print("Skipping {0}".format(fname))
             continue
         
-        has_board, corners = cv2.findChessboardCorners(im, chessboard_size)
+        has_board, corners = cv2.findChessboardCorners(im, tuple(chessboard_size))
         if has_board:
             term = ( cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT, 30, 0.1 )
             cv2.cornerSubPix(im, corners, (5, 5), (-1, -1), term)
@@ -151,16 +148,18 @@ def calibrate_opencv(corners, images, chessboard_size):
     h, w = images[0].shape[:2]
     
     object_points = [chessboard_to_world(chessboard_size),]*len(corners)
-    flags = cv2.cv.CV_CALIB_FIX_K1 | cv2.cv.CV_CALIB_FIX_K2 | cv2.cv.CV_CALIB_FIX_K3 | \
-            cv2.cv.CV_CALIB_ZERO_TANGENT_DIST
-    print "Running OpenCV calibrator on {:d} image points".format(len(corners))
-    rms, camera_matrix, dist_coefs, rvecs, tvecs = cv2.calibrateCamera(object_points, corners, (w, h), flags=flags)
-    print "RMS", rms
+    flags = cv2.CALIB_FIX_K1 | cv2.CALIB_FIX_K2 | cv2.CALIB_FIX_K3 | \
+            cv2.CALIB_ZERO_TANGENT_DIST
+    print("Running OpenCV calibrator on {:d} image points".format(len(corners)))
+    K0 = np.eye(3)
+    d0 = np.zeros(8)
+    rms, camera_matrix, dist_coefs, rvecs, tvecs = cv2.calibrateCamera(object_points, corners, (w, h), K0, d0, flags=flags)
+    print("RMS", rms)
     return camera_matrix, rvecs, tvecs
 
 def build_opencv_calibration(image_dir, chessboard_size):
     corners_fname = os.path.join(image_dir, 'corners.hdf')
-    print "Loading from", corners_fname
+    print("Loading from", corners_fname)
     corners, images, image_keys = load_corners(corners_fname)
     K, rvecs, tvecs = calibrate_opencv(corners, images, chessboard_size)
     
@@ -232,7 +231,7 @@ if __name__ == "__main__":
     parser.add_argument("--view-mode", choices=("opt-result","rectify"), default="opt-result")
     parser.add_argument("--max", type=int, default=None)
     args = parser.parse_args()
-    print args
+    print(args)
 
     # Only viewing?
     if args.view is not None:
@@ -261,7 +260,7 @@ if __name__ == "__main__":
             plt.figure()
             for idx in indices:
                 fname = sorted(imlistgrp.keys())[idx]
-                print "Looking at", fname
+                print("Looking at", fname)
                 imgrp = imlistgrp[fname]
                 R = imgrp["R"].value
                 t = imgrp["t"].value.reshape(3,1)
@@ -322,11 +321,11 @@ if __name__ == "__main__":
                         pu3d_2d = K.dot(pu3d_2)
                         pu3d_2d /= np.tile(pu3d_2d[2], (3,1))
                         
-                        print pu3d_2d
-                        print p
+                        print(pu3d_2d)
+                        print(p)
                         dtmp = np.sum((pu3d_2d - p)**2, axis=0)
-                        print dtmp
-                        print dtmp.min(), dtmp.max()
+                        print(dtmp)
+                        print(dtmp.min(), dtmp.max())
                     
                     plt.subplot(2,1,1)
                     plt.imshow(im)
@@ -342,7 +341,7 @@ if __name__ == "__main__":
     # Build corners from input directory
     corners_fname = os.path.join(args.inputdir, "corners.hdf")
     if not os.path.exists(corners_fname):
-        print "Creating {}".format(corners_fname)
+        print("Creating {}".format(corners_fname))
         build_corners(args.inputdir, args.chessboard)
 
     if args.mode == 'atan-reproj-K':
@@ -366,21 +365,21 @@ if __name__ == "__main__":
         
         # Now we have a guess of the intrinsic camera matrix
         # and the camera rotation and translation vectors
-        print "Camera matrix according to OpenCV"
-        print K
+        print("Camera matrix according to OpenCV")
+        print(K)
         
 
         # Sanity check, just to look at the reprojection errors
         if False:
             object_points = chessboard_to_world(args.chessboard)        
             for i, (r, t, im, corn) in enumerate(zip(rvecs, tvecs, images, corner_list)):
-                print i
+                print(i)
                 R = cv2.Rodrigues(r)[0]
                 x = K.dot(R.dot(object_points.T) + t)
                 x /= np.tile(x[2], (3,1))
-                print x[:, 5:]
-                print corn.T.reshape(2,-1)[:,5:]
-                print "---"
+                print(x[:, 5:])
+                print(corn.T.reshape(2,-1)[:,5:])
+                print("---")
                 if i == 1:
                     break
         
@@ -414,16 +413,16 @@ if __name__ == "__main__":
         #print residuals
         #print np.mean(residuals), np.std(residuals)        
         
-        print "Running atan-lines optimizer on {:d} points".format(len(corner_list)*np.prod(args.chessboard))
+        print("Running atan-reproj-K optimizer on {:d} points".format(len(corner_list)*np.prod(args.chessboard)))
         #x, covx, infodict, mesg, ier = scipy.optimize.leastsq(optfunc_reproj_late, x0, (corner_list, object_points), full_output=True)
         scaling = np.ones_like(x0)
         scaling[:4] = 100.0
         scaling[5:6] = 1000.0
         scaling[7] = 0.001
         x, covx, infodict, mesg, ier = scipy.optimize.leastsq(optfunc_reproj, x0, (corner_list, object_points), diag=scaling, full_output=True)
-        print "X[:7] = ",x[:7]
-        print mesg
-        print infodict['nfev'], "evaluations"
+        print("X[:7] = ",x[:7])
+        print(mesg)
+        print(infodict['nfev'], "evaluations")
 
         # Store results        
         atanproj_fname = os.path.join(args.inputdir, 'atanprojres.hdf')
@@ -469,11 +468,11 @@ if __name__ == "__main__":
             lines.extend(vl)
             lines.extend(hl)
     
-        print "Running atan-lines optimizer on {:d} line segments".format(len(lines))
+        print("Running atan-lines optimizer on {:d} line segments".format(len(lines)))
         x, covx, infodict, mesg, ier = scipy.optimize.leastsq(optfunc_atan_lines, x0, (lines, ), diag=(1000,1000,0.001), full_output=True, xtol=1e-10)
-        print "X=",x
-        print mesg
-        print infodict['nfev'], "evaluations"
+        print("X=",x)
+        print(mesg)
+        print(infodict['nfev'], "evaluations")
         
         wc = x[:2]
         lgamma = x[2]
@@ -481,10 +480,10 @@ if __name__ == "__main__":
         xmap, ymap = np.meshgrid(range(1920), range(1080))
         m = np.dstack((xmap, ymap))
         p = m.T.reshape(2,-1)
-        print p[:, :5]
+        print(p[:, :5])
         pu = lensdist_inv(p, wc, lgamma)
-        print pu[:,:5]
-        print pu.min(), pu.max(), pu.mean()
+        print(pu[:,:5])
+        print(pu.min(), pu.max(), pu.mean())
         
         mu = pu.reshape(m.shape[::-1]).T
         xmapu = mu[:,:,0]
